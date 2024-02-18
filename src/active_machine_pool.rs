@@ -1,47 +1,46 @@
-use std::{ffi::OsStr, path::PathBuf, sync::{Arc, Mutex}};
+use std::{path::PathBuf, sync::{Arc, Mutex}};
 
 use log::{as_serde, error, info};
 use moka::{future::{Cache, FutureExt}, notification::ListenerFuture, policy::EvictionPolicy};
 use rustcracker::{components::machine::{Config, Machine, MachineCore}, model::{memory_backend::{BackendType, MemoryBackend}, snapshot_load_params::SnapshotLoadParams}};
-use sqlx::PgPool;
+use sqlx::{PgPool, types::uuid};
 use chrono::prelude::*;
+use uuid::Uuid;
 
 use crate::{error::{VmManageError, VmManageResult}, models::{SnapshotInfo, VmViewInfo, DEFAULT_MACHINE_CORE_TABLE, DEFAULT_SNAPSHOT_TABLE, DEFAULT_VM_CONFIG_TABLE, MACHINE_CORE_TABLE_NAME, SNAPSHOT_TABLE_NAME, VM_CONFIG_TABLE_NAME}};
 
 
 /// Serve as a cache and manage connection with Postgresql
 /// if a Machine is active
+#[derive(Clone)]
 pub struct ActiveMachinePool {
-    pool_id: String,
-    machines: Cache<String, Arc<Mutex<Machine>>>,
+    pool_id: Uuid,
+    machines: Cache<Uuid, Arc<Mutex<Machine>>>,
     conn: PgPool,
 }
 
-#[derive(sqlx::FromRow, sqlx::Type)]
-#[sqlx(type_name = "pg_machine_core_element")]
+#[derive(sqlx::FromRow)]
 pub struct PgMachineCoreElement {
-    vmid: String,
+    vmid: Uuid,
     machine_core: sqlx::types::Json<MachineCore>,
 }
 
-#[derive(sqlx::FromRow, sqlx::Type)]
-#[sqlx(type_name = "pg_vm_config_element")]
+#[derive(sqlx::FromRow)]
 pub struct PgVmConfigElement {
-    vmid: String,
+    vmid: Uuid,
     config: sqlx::types::Json<Config>,
 }
 
-#[derive(sqlx::FromRow, sqlx::Type)]
-#[sqlx(type_name = "pg_snapshot_element")]
+#[derive(sqlx::FromRow)]
 pub struct PgSnapshotElement {
-    vmid: String,
+    vmid: Uuid,
     snapshot_id: String,
     snapshot_info: sqlx::types::Json<SnapshotInfo>,
 }
 
 // Private methods
 impl ActiveMachinePool {
-    async fn delete_core(&self, vmid: &String) -> VmManageResult<()> {
+    async fn delete_core(&self, vmid: Uuid) -> VmManageResult<()> {
         let machine_core_storage_table = self.machine_core_storage_table();
         if let Err(_e) = sqlx::query("DELETE * FROM $1 WHERE vmid = $2")
             .bind(&machine_core_storage_table)
@@ -54,7 +53,7 @@ impl ActiveMachinePool {
         Ok(())
     }
 
-    async fn store_core(&self, vmid: &String, core: &MachineCore) -> VmManageResult<()> {
+    async fn store_core(&self, vmid: Uuid, core: &MachineCore) -> VmManageResult<()> {
         let machine_core_storage_table = self.machine_core_storage_table();
         if let Err(e) =
             sqlx::query("INSERT INTO $1 (vmid, machine_core) VALUES ($2, $3)")
@@ -70,7 +69,7 @@ impl ActiveMachinePool {
         Ok(())
     }
 
-    async fn delete_config(&self, vmid: &String) -> VmManageResult<()> {
+    async fn delete_config(&self, vmid: Uuid) -> VmManageResult<()> {
         let config_storage_table = self.config_storage_table();
         if let Err(_e) = sqlx::query("DELETE * FROM $1 WHERE vmid = $2")
             .bind(&config_storage_table)
@@ -83,7 +82,7 @@ impl ActiveMachinePool {
         Ok(())
     }
 
-    async fn store_config(&self, vmid: &String, config: &Config) -> VmManageResult<()> {
+    async fn store_config(&self, vmid: Uuid, config: &Config) -> VmManageResult<()> {
         let config_storage_table = self.config_storage_table();
         if let Err(e) = sqlx::query("INSERT INTO $1 (vmid, config) VALUES ($2, $3)")
             .bind(&config_storage_table)
@@ -98,7 +97,7 @@ impl ActiveMachinePool {
         Ok(())
     }
 
-    async fn delete_snapshot(&self, vmid: &String, snapshot_id: &String) -> VmManageResult<()> {
+    async fn delete_snapshot(&self, vmid: Uuid, snapshot_id: Uuid) -> VmManageResult<()> {
         let snapshot_table = self.snapshot_storage_table();
         if let Err(_e) = sqlx::query("DELETE * FROM $1 WHERE vmid = $2 AND snapshot_id = $3")
             .bind(&snapshot_table)
@@ -112,7 +111,7 @@ impl ActiveMachinePool {
         Ok(())
     }
 
-    async fn store_snapshot(&self, vmid: &String, snapshot_id: &String, info: &SnapshotInfo) -> VmManageResult<()> {
+    async fn store_snapshot(&self, vmid: Uuid, snapshot_id: Uuid, info: &SnapshotInfo) -> VmManageResult<()> {
         let snapshot_table = self.snapshot_storage_table();
         if let Err(e) = sqlx::query("INSERT INTO $1 (vmid, snapshot_id, snapshot_info) VALUES ($2, $3, $4)")
             .bind(&snapshot_table)
@@ -148,7 +147,11 @@ impl ActiveMachinePool {
 // 2. rebuild failure
 // 3. 
 impl ActiveMachinePool {
-    pub async fn new(id: &str, size: u64, conn: PgPool) -> Self {
+    pub fn id(&self) -> Uuid {
+        self.pool_id
+    }
+
+    pub async fn new(id: Uuid, size: u64, conn: PgPool) -> Self {
         let conn_back = conn.clone();
         let id_clone = id.to_string();
         let conn1 = Arc::new(conn);
@@ -156,7 +159,7 @@ impl ActiveMachinePool {
         // eviction listener.
         // When the Machine agent is evicted then refresh the core and config into the database.
         let eviction_listener =
-            move |k: Arc<String>, v: Arc<Mutex<Machine>>, cause| -> ListenerFuture {
+            move |k: Arc<Uuid>, v: Arc<Mutex<Machine>>, cause| -> ListenerFuture {
                 info!(target: "cache eviction", "A Machine has been evicted. vmid: {k:?}, cause: {cause:?}");
                 let conn2 = Arc::clone(&conn1);
                 let core = v.lock().unwrap().dump_into_core().unwrap();
@@ -231,13 +234,13 @@ impl ActiveMachinePool {
 
     /// Create a machine into the pool
     /// dump the core and configuration into database
-    pub async fn create_machine(&self, vmid: &String, cfg: &Config) -> VmManageResult<()> {
+    pub async fn create_machine(&self, vmid: Uuid, cfg: &Config) -> VmManageResult<()> {
         let (machine, _exit_ch) = Machine::new(cfg.clone())?;
         let core = machine.dump_into_core()?;
 
         // cache the machine
         self.machines
-            .insert(vmid.to_string(), Arc::new(Mutex::new(machine)))
+            .insert(vmid, Arc::new(Mutex::new(machine)))
             .await;
         // store the machine core
         self.store_core(vmid, &core).await?;
@@ -248,10 +251,10 @@ impl ActiveMachinePool {
     }
 
     /// Start machine by vmid, if not exists then error.
-    pub async fn start_machine(&self, vmid: &String) -> VmManageResult<()> {
+    pub async fn start_machine(&self, vmid: Uuid) -> VmManageResult<()> {
         let machine = self
             .machines
-            .get(vmid)
+            .get(&vmid)
             .await
             .ok_or(VmManageError::NotFound)?;
         machine.lock().unwrap().start().await?;
@@ -261,10 +264,10 @@ impl ActiveMachinePool {
     /// Pause machine by vmid, if not exists then error.
     /// Useful then the user want to pause the machine and could easily resume
     /// it without cpu, memory and other status of machine being changed.
-    pub async fn pause_machine(&self, vmid: &String) -> VmManageResult<()> {
+    pub async fn pause_machine(&self, vmid: Uuid) -> VmManageResult<()> {
         let machine = self
             .machines
-            .get(vmid)
+            .get(&vmid)
             .await
             .ok_or(VmManageError::NotFound)?;
         machine.lock().unwrap().pause().await?;
@@ -273,10 +276,10 @@ impl ActiveMachinePool {
 
     /// Resume machine by vmid, if not exists then error.
     /// Resume from `Pause`
-    pub async fn resume_machine(&self, vmid: &String) -> VmManageResult<()> {
+    pub async fn resume_machine(&self, vmid: Uuid) -> VmManageResult<()> {
         let machine = self
             .machines
-            .get(vmid)
+            .get(&vmid)
             .await
             .ok_or(VmManageError::NotFound)?;
         machine.lock().unwrap().resume().await?;
@@ -285,10 +288,10 @@ impl ActiveMachinePool {
 
     /// Stop the machine by vmid.
     /// Useful when the user want to stop the machine and expect to re-use it.
-    pub async fn stop_machine(&self, vmid: &String) -> VmManageResult<()> {
+    pub async fn stop_machine(&self, vmid: Uuid) -> VmManageResult<()> {
         if let Some(machine) = self
             .machines
-            .remove(vmid)
+            .remove(&vmid)
             .await
         {
             // if the machine exists in memory
@@ -308,7 +311,7 @@ impl ActiveMachinePool {
     /// Useful when the user want to totally delete the machine.
     /// the machine will disappear along with its core and its config.
     /// if not exists then error.
-    pub async fn delete_machine(&self, vmid: &String) -> VmManageResult<()> {
+    pub async fn delete_machine(&self, vmid: Uuid) -> VmManageResult<()> {
         // stop the machine
         self.stop_machine(vmid).await?;
         
@@ -323,7 +326,7 @@ impl ActiveMachinePool {
     /// Rebuild machine by vmid from config.
     /// Useful when the user have `Stop`ped the machine and want to restart it again
     /// without storage(disk) and other devices configured with `Config` changed
-    pub async fn rebuild_from_config(&self, vmid: &String) -> VmManageResult<()> {
+    pub async fn rebuild_from_config(&self, vmid: Uuid) -> VmManageResult<()> {
         let config_storage_table = self.config_storage_table();
         let element = sqlx::query_as::<_, PgVmConfigElement>("SELECT * FROM $1 WHERE vmid = $2")
             .bind(config_storage_table)
@@ -341,7 +344,7 @@ impl ActiveMachinePool {
     /// Rebuild machine by vmid from config.
     /// Hot rebuild. Re-attach the agent to the Vm if needed after the Machine instance
     /// is evicted from the cache or after the Vm manage process's corruption and restoration.
-    async fn rebuild_from_core(&self, vmid: &String) -> VmManageResult<Machine> {
+    async fn rebuild_from_core(&self, vmid: Uuid) -> VmManageResult<Machine> {
         let machine_core_storage_table = self.machine_core_storage_table();
         let element = sqlx::query_as::<_, PgMachineCoreElement>("SELETE * FROM $1 WHERE vmid = $2")
             .bind(machine_core_storage_table)
@@ -370,14 +373,14 @@ impl ActiveMachinePool {
     }
 
     /// Query machine status.
-    pub async fn get_status(&self, vmid: &String) -> VmManageResult<VmViewInfo> {
+    pub async fn get_status(&self, vmid: Uuid) -> VmManageResult<VmViewInfo> {
         let machine_core_storage_table = self.machine_core_storage_table();
-        if let Some(machine) = self.machines.get(vmid).await {
+        if let Some(machine) = self.machines.get(&vmid).await {
             let mut machine = machine.lock().unwrap();
             let info = machine.describe_instance_info().await?;
             let config = machine.get_config();
             let full_config = machine.get_export_vm_config().await?;
-            let res = VmViewInfo { user_id: String::new(), vmid: vmid.to_owned(), vm_info: info, full_config, boot_config: config };
+            let res = VmViewInfo { vmid, vm_info: info, full_config, boot_config: config };
             Ok(res)
         } else {
             let element = sqlx::query_as::<_, PgMachineCoreElement>("SELECT * FROM $1 WHERE vmid = $2")
@@ -390,13 +393,13 @@ impl ActiveMachinePool {
             let info = machine.describe_instance_info().await?;
             let config = machine.get_config();
             let full_config = machine.get_export_vm_config().await?;
-            let res = VmViewInfo { user_id: String::new(), vmid: vmid.to_owned(), vm_info: info, full_config, boot_config: config };
+            let res = VmViewInfo { vmid: vmid.to_owned(), vm_info: info, full_config, boot_config: config };
             Ok(res)
         }
     }
 
     /// Get snapshot detail
-    pub async fn get_snapshot_detail(&self, vmid: &String, snapshot_id: &String) -> VmManageResult<SnapshotInfo> {
+    pub async fn get_snapshot_detail(&self, vmid: Uuid, snapshot_id: Uuid) -> VmManageResult<SnapshotInfo> {
         let snapshot_storage_table = self.snapshot_storage_table();
         let element = sqlx::query_as::<_, PgSnapshotElement>("SELECT * FROM $1 WHERE vmid = $2 AND snapshot_id = $3")
             .bind(&snapshot_storage_table)
@@ -409,9 +412,10 @@ impl ActiveMachinePool {
     }
 
     /// Create snapshot at given path
-    pub async fn create_snapshot(&self, vmid: &String, snapshot_id: &String, snapshot_path: &PathBuf, memory_path: &PathBuf) -> VmManageResult<()> {
+    pub async fn create_snapshot(&self, vmid: Uuid, snapshot_path: &PathBuf, memory_path: &PathBuf) -> VmManageResult<SnapshotInfo> {
+        let snapshot_id = Uuid::new_v4();
         let machine_core_storage_table = self.machine_core_storage_table();
-        if let Some(machine) = self.machines.get(vmid).await {
+        if let Some(machine) = self.machines.get(&vmid).await {
             let machine = machine.lock().unwrap();
             machine.create_snapshot(memory_path, snapshot_path).await?;
         } else {
@@ -425,11 +429,10 @@ impl ActiveMachinePool {
             machine.create_snapshot(memory_path, snapshot_path).await?;
         }
 
-        // delete original snapshots (fs)
-
         // create current info
         let local: DateTime<Local> = Local::now();
         let info = SnapshotInfo {
+            snapshot_id,
             memory_path: memory_path.to_owned(),
             snapshot_path: snapshot_path.to_owned(),
             created_at: local,
@@ -437,11 +440,11 @@ impl ActiveMachinePool {
         self.delete_snapshot(vmid, snapshot_id).await?;
         self.store_snapshot(vmid, snapshot_id, &info).await?;
 
-        Ok(())
+        Ok(info)
     }
 
     /// Restore machine from given snapshot
-    pub async fn restore_from_snapshot(&self, vmid: &String, snapshot_id: &String) -> VmManageResult<()> {
+    pub async fn restore_from_snapshot(&self, vmid: Uuid, snapshot_id: Uuid) -> VmManageResult<()> {
         let machine_core_storage_table = self.machine_core_storage_table();
         let snapshot_storage_table = self.snapshot_storage_table();
         let element = sqlx::query_as::<_, PgSnapshotElement>("SELECT * FROM $1 WHERE vmid = $2 AND snapshot_id = $3").bind(snapshot_storage_table).bind(vmid).bind(snapshot_id).fetch_one(&self.conn).await?;
@@ -456,7 +459,7 @@ impl ActiveMachinePool {
             resume_vm: Some(true),
             snapshot_path: info.snapshot_path,
         };
-        if let Some(machine) = self.machines.get(vmid).await {
+        if let Some(machine) = self.machines.get(&vmid).await {
             let mut machine = machine.lock().unwrap();
             machine.load_from_snapshot(&snapshot_load_params).await?;
         } else {
@@ -474,9 +477,9 @@ impl ActiveMachinePool {
     }
 
     /// Modify metadata of given machine
-    pub async fn modify_metadata(&self, vmid: &String, metadata: &String) -> VmManageResult<()> {
+    pub async fn modify_metadata(&self, vmid: Uuid, metadata: &String) -> VmManageResult<()> {
         let machine_core_storage_table = self.machine_core_storage_table();
-        if let Some(machine) = self.machines.get(vmid).await {
+        if let Some(machine) = self.machines.get(&vmid).await {
             let machine = machine.lock().unwrap();
             machine.update_metadata(metadata).await?;
         } else {

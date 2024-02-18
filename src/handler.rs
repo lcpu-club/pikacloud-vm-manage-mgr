@@ -18,7 +18,7 @@ async fn create_machine_handler(
     pool: web::Data<ActiveMachinePool>,
 ) -> impl Responder {
     let request = request.into_inner();
-    let res = pool.create_machine(&request.vmid, &request.config).await;
+    let res = pool.create_machine(request.vmid, &request.config).await;
     match res {
         Ok(_) => HttpResponse::Ok().finish(),
         Err(e) => HttpResponse::InternalServerError().body(e.to_string()),
@@ -31,7 +31,7 @@ async fn get_vm_status_handler(
     pool: web::Data<ActiveMachinePool>,
 ) -> impl Responder {
     let request = request.into_inner();
-    let res = pool.get_status(&request.vmid).await;
+    let res = pool.get_status(request.vmid).await;
     match res {
         Ok(info) => HttpResponse::Ok().json(info),
         Err(e) => HttpResponse::InternalServerError().body(e.to_string()),
@@ -44,7 +44,7 @@ async fn modify_metadata_handler(
     pool: web::Data<ActiveMachinePool>,
 ) -> impl Responder {
     let request = request.into_inner();
-    let res = pool.modify_metadata(&request.vmid, &request.metadata).await;
+    let res = pool.modify_metadata(request.vmid, &request.metadata).await;
     match res {
         Ok(_) => HttpResponse::Ok().finish(),
         Err(e) => HttpResponse::InternalServerError().body(e.to_string()),
@@ -58,10 +58,10 @@ async fn operate_machine_handler(
 ) -> impl Responder {
     let request = request.into_inner();
     let res = match request.operation {
-        Operation::Start => pool.start_machine(&request.vmid).await,
-        Operation::Pause => pool.pause_machine(&request.vmid).await,
-        Operation::Resume => pool.resume_machine(&request.vmid).await,
-        Operation::Stop => pool.stop_machine(&request.vmid).await,
+        Operation::Start => pool.start_machine(request.vmid).await,
+        Operation::Pause => pool.pause_machine(request.vmid).await,
+        Operation::Resume => pool.resume_machine(request.vmid).await,
+        Operation::Stop => pool.stop_machine(request.vmid).await,
     };
     match res {
         Ok(_) => HttpResponse::Ok().finish(),
@@ -75,7 +75,7 @@ async fn delete_machine_handler(
     pool: web::Data<ActiveMachinePool>,
 ) -> impl Responder {
     let request = request.into_inner();
-    let res = pool.delete_machine(&request.vmid).await;
+    let res = pool.delete_machine(request.vmid).await;
     match res {
         Ok(_) => HttpResponse::Ok().finish(),
         Err(e) => HttpResponse::InternalServerError().body(e.to_string()),
@@ -89,7 +89,7 @@ async fn get_snapshot_detail_handler(
 ) -> impl Responder {
     let request = request.into_inner();
     let res = pool
-        .get_snapshot_detail(&request.vmid, &request.snapshot_id)
+        .get_snapshot_detail(request.vmid, request.snapshot_id)
         .await;
     match res {
         Ok(info) => HttpResponse::Ok().json(info),
@@ -105,8 +105,7 @@ async fn create_snapshot_handler(
     let request = request.into_inner();
     let res = pool
         .create_snapshot(
-            &request.vmid,
-            &request.snapshot_id,
+            request.vmid,
             &request.snapshot_path,
             &request.memory_path,
         )
@@ -125,8 +124,8 @@ async fn restore_from_snapshot_handler(
     let request = request.into_inner();
     let res = pool
         .restore_from_snapshot(
-            &request.vmid,
-            &request.snapshot_id,
+            request.vmid,
+            request.snapshot_id,
         )
         .await;
     match res {

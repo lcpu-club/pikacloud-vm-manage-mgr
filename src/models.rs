@@ -8,6 +8,7 @@ use rustcracker::{
 use serde::{Deserialize, Serialize};
 use sqlx::{postgres::PgRow, PgPool, Row};
 use chrono::prelude::*;
+use uuid::Uuid;
 use std::path::PathBuf;
 
 use crate::error::VmManageError;
@@ -21,13 +22,13 @@ pub struct ErrorResponse {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct VmCreateRequest {
-    pub vmid: String,
+    pub vmid: Uuid,
     pub config: Config,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct VmQueryStatusRequest {
-    pub vmid: String,
+    pub vmid: Uuid,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -40,55 +41,53 @@ pub enum Operation {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct VmOperateRequest {
-    pub vmid: String,
+    pub vmid: Uuid,
     pub operation: Operation,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct VmDeleteRequest {
-    pub vmid: String,
+    pub vmid: Uuid,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct VmCreateSnapshotRequest {
-    pub vmid: String,
-    pub snapshot_id: String,
+    pub vmid: Uuid,
     pub snapshot_path: PathBuf,
     pub memory_path: PathBuf,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct VmLoadSnapshotRequest {
-    pub vmid: String,
-    pub snapshot_id: String,
+    pub vmid: Uuid,
+    pub snapshot_id: Uuid,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct VmModifyMetadataRequest {
-    pub vmid: String,
+    pub vmid: Uuid,
     pub metadata: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct VmSnapshotDetailRequest {
-    pub vmid: String,
-    pub snapshot_id: String,
+    pub vmid: Uuid,
+    pub snapshot_id: Uuid,
 }
 
 // Schemas
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct VmViewConfig {
-    user_id: Option<String>,
-    vmid: Option<String>,
+    user_id: Option<Uuid>,
+    vmid: Option<Uuid>,
     config: Option<sqlx::types::Json<full_vm_configuration::FullVmConfiguration>>,
     execute_dir: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct VmViewInfo {
-    pub user_id: String,
-    pub vmid: String,
+    pub vmid: Uuid,
     pub vm_info: InstanceInfo,
     pub full_config: FullVmConfiguration,
     pub boot_config: Config,
@@ -96,6 +95,7 @@ pub struct VmViewInfo {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SnapshotInfo {
+    pub snapshot_id: Uuid,
     pub snapshot_path: PathBuf,
     pub memory_path: PathBuf,
     pub created_at: DateTime<Local>,

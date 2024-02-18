@@ -11,7 +11,16 @@ async-channel = "2.2.0"
 chrono = { version = "0.4.34", features = ["serde"] }
 dotenv = "0.15.0"
 log = { version = "0.4.20", features = ["kv_unstable_serde", "serde"] }
+log4rs = "1.3.0"
 moka = { version = "0.12.5", features = ["sync", "future"] }
 rustcracker = "1.0.1"
 serde = { version = "1.0.196", features = ["derive"] }
-sqlx = { version = "0.7.3", features = ["macros", "json", "postgres"] }
+sqlx = { version = "0.7.3", features = ["macros", "json", "postgres", "uuid"] }
+[dependencies.uuid]
+version = "1.6.1"
+features = [
+    "v4",                # Lets you generate random UUIDs
+    "fast-rng",          # Use a faster (but still sufficiently random) RNG
+    "macro-diagnostics", # Enable better diagnostics for compile-time UUIDs
+    "serde",
+]
