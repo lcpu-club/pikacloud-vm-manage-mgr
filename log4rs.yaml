@@ -12,13 +12,11 @@ root:
   appenders:
     - stdout
 loggers:
-  # pikacloud-vm-manage-mgr::database:
-  #   level: debug
-  # pikacloud-vm-manage-mgr::operation:
-  #   level: debug
-  #   appenders:
-  #     - requests
-  #   additive: false
+  pikacloud-vm-manage-mgr::operation:
+    level: debug
+    appenders:
+      - requests
+    additive: false
   pikacloud-vm-manage-mgr::handler:
     level: debug
     appenders:

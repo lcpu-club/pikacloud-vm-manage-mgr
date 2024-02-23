@@ -1,13 +1,12 @@
+
+
 use crate::{
-    active_machine_pool::ActiveMachinePool,
-    machine_pool::{FirecrackerVmManagePool, VmManagePool},
-    models::*,
+    machine_pool::{self, VmManagePool},
+    models::*, operation::*,
 };
 /// handler for the routes
 use actix_web::{delete, get, post, put, web, HttpResponse, Responder};
-use rustcracker::components::machine::Config;
 use tokio::sync::Mutex;
-use uuid::Uuid;
 
 #[get("/api/v1")]
 async fn index() -> impl Responder {
@@ -21,11 +20,11 @@ async fn get_root_vm_page_handler() -> impl Responder {
 
 #[post("/api/v1/vm")]
 async fn create_machine_handler(
+    pool: web::Data<Mutex<VmManagePool>>,
     request: web::Json<VmCreateRequest>,
-    pool: web::Data<Mutex<FirecrackerVmManagePool>>,
 ) -> impl Responder {
     let request = request.into_inner();
-    let res = pool.lock().await.create_machine(&request.config).await;
+    let res = create_vm_op(pool, &request.config).await;
     match res {
         Ok(vmid) => HttpResponse::Ok().json(VmCreateResponse {
             vmid,
@@ -37,11 +36,11 @@ async fn create_machine_handler(
 
 #[get("/api/v1/vm/{vmid}")]
 async fn get_vm_status_handler(
+    pool: web::Data<Mutex<VmManagePool>>,
     request: web::Json<VmQueryStatusRequest>,
-    pool: web::Data<Mutex<FirecrackerVmManagePool>>,
 ) -> impl Responder {
     let request = request.into_inner();
-    let res = pool.lock().await.get_status(&request.vmid).await;
+    let res = get_vm_status_op(pool, request.vmid).await;
     match res {
         Ok(info) => HttpResponse::Ok().json(info),
         Err(e) => HttpResponse::InternalServerError().body(e.to_string()),
@@ -50,15 +49,11 @@ async fn get_vm_status_handler(
 
 #[put("/api/v1/vm/{vmid}")]
 async fn modify_metadata_handler(
+    pool: web::Data<Mutex<VmManagePool>>,
     request: web::Json<VmModifyMetadataRequest>,
-    pool: web::Data<Mutex<FirecrackerVmManagePool>>,
 ) -> impl Responder {
     let request = request.into_inner();
-    let res = pool
-        .lock()
-        .await
-        .modify_metadata(&request.vmid, &request.metadata)
-        .await;
+    let res = modify_metadata_op(pool, request.vmid, &request.metadata).await;
     match res {
         Ok(_) => HttpResponse::Ok().json(VmModifyMetadataResponse {
             vmid: request.vmid,
@@ -70,15 +65,15 @@ async fn modify_metadata_handler(
 
 #[put("/api/v1/vm/{vmid}/power_state")]
 async fn operate_machine_handler(
+    pool: web::Data<Mutex<VmManagePool>>,
     request: web::Json<VmOperateRequest>,
-    pool: web::Data<Mutex<FirecrackerVmManagePool>>,
 ) -> impl Responder {
     let request = request.into_inner();
     let res = match request.operation {
-        Operation::Start => pool.lock().await.start_machine(&request.vmid).await,
-        Operation::Pause => pool.lock().await.pause_machine(&request.vmid).await,
-        Operation::Resume => pool.lock().await.resume_machine(&request.vmid).await,
-        Operation::Stop => pool.lock().await.stop_machine(&request.vmid).await,
+        Operation::Start => start_vm_op(pool, request.vmid).await,
+        Operation::Pause => pause_vm_op(pool, request.vmid).await,
+        Operation::Resume => resume_vm_op(pool, request.vmid).await,
+        Operation::Stop => stop_vm_op(pool, request.vmid).await,
     };
     match res {
         Ok(_) => HttpResponse::Ok().json(VmOperateResponse {
@@ -91,11 +86,11 @@ async fn operate_machine_handler(
 
 #[delete("/api/v1/vm/delete")]
 async fn delete_machine_handler(
+    pool: web::Data<Mutex<VmManagePool>>,
     request: web::Json<VmDeleteRequest>,
-    pool: web::Data<Mutex<FirecrackerVmManagePool>>,
 ) -> impl Responder {
     let request = request.into_inner();
-    let res = pool.lock().await.delete_machine(&request.vmid).await;
+    let res = delete_vm_op(pool, request.vmid).await;
     match res {
         Ok(_) => HttpResponse::Ok().json(VmDeleteResponse {
             vmid: request.vmid,
@@ -105,64 +100,11 @@ async fn delete_machine_handler(
     }
 }
 
-#[get("/api/v1/vm/{vmid}/snapshots/{snapshot_id}")]
-async fn get_snapshot_detail_handler(
-    request: web::Json<VmSnapshotDetailRequest>,
-    pool: web::Data<Mutex<FirecrackerVmManagePool>>,
-) -> impl Responder {
-    let request = request.into_inner();
-    let res = pool.
-        lock().await
-        .get_snapshot_detail(&request.vmid, &request.snapshot_id)
-        .await;
-    match res {
-        Ok(info) => HttpResponse::Ok().json(info),
-        Err(e) => HttpResponse::InternalServerError().body(e.to_string()),
-    }
-}
-
-#[post("/api/v1/vm/{vmid}/snapshots")]
-async fn create_snapshot_handler(
-    request: web::Json<VmCreateSnapshotRequest>,
-    pool: web::Data<Mutex<FirecrackerVmManagePool>>,
-) -> impl Responder {
-    let request = request.into_inner();
-    let res = pool.
-        lock().await
-        .create_snapshot(
-            &request.vmid,
-        )
-        .await;
-    match res {
-        Ok(info) => HttpResponse::Ok().json(info),
-        Err(e) => HttpResponse::InternalServerError().body(e.to_string()),
-    }
-}
-
-// #[post("/api/v1/vm/{vmid}/snapshots/{snapshot_id}/restore")]
-// async fn restore_from_snapshot_handler(
-//     request: web::Json<VmLoadSnapshotRequest>,
-//     pool: web::Data<Mutex<FirecrackerVmManagePool>>,
-// ) -> impl Responder {
-//     let request = request.into_inner();
-//     let res = pool.
-//         lock().await
-//         .restore_from_snapshot(
-//             &request.vmid,
-//             &request.snapshot_id,
-//         )
-//         .await;
-//     match res {
-//         Ok(_) => HttpResponse::Ok().finish(),
-//         Err(e) => HttpResponse::InternalServerError().body(e.to_string()),
-//     }
-// }
-
 /// Attach to the machine with specified device (root file system / virtio device)
 #[post("/api/v1/vm/{vmid}/volume/attach")]
 async fn attach_volume_to_machine_handler(
     request: web::Json<()>,
-    pool: web::Data<Mutex<FirecrackerVmManagePool>>,
+    pool: web::Data<Mutex<VmManagePool>>,
 ) -> impl Responder {
     HttpResponse::Ok().finish()
 }
@@ -171,7 +113,7 @@ async fn attach_volume_to_machine_handler(
 #[delete("/api/v1/vm/{vmid}/volume/delete")]
 async fn delete_volume_from_machine_handler(
     request: web::Json<()>,
-    pool: web::Data<Mutex<FirecrackerVmManagePool>>,
+    pool: web::Data<Mutex<VmManagePool>>,
 ) -> impl Responder {
     HttpResponse::Ok().finish()
 }
@@ -179,10 +121,10 @@ async fn delete_volume_from_machine_handler(
 #[post("/api/v1/vm/restoreall")]
 async fn restore_all_machines_from_core(
     request: web::Json<()>,
-    pool: web::Data<Mutex<FirecrackerVmManagePool>>,
+    pool: web::Data<Mutex<VmManagePool>>,
 ) -> impl Responder {
     let request = request.into_inner();
-    let res = pool.lock().await.restore_all().await;
+    let res = restore_all_op(pool).await;
     match res {
         Ok(infos) => HttpResponse::Ok().json(VmRestoreAllResponse { infos }),
         Err(e) => HttpResponse::InternalServerError().body(e.to_string()),

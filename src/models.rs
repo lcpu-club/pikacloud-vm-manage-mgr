@@ -109,7 +109,7 @@ pub struct VmRestoreAllRequest {}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct VmRestoreAllResponse {
-    pub infos: Vec<VmViewInfo>,
+    pub infos: Vec<Uuid>,
 }
 
 // Schemas

@@ -21,6 +21,7 @@ sqlx = { version = "0.7.3", features = ["macros", "json", "postgres", "uuid"] }
 tokio = "1.36.0"
 run_script = "0.10.1"
 serde_json = "1.0.114"
+etcd-client = "0.12.4"
 [dependencies.uuid]
 version = "1.6.1"
 features = [

@@ -1,6 +1,5 @@
 use std::{collections::BTreeMap, env, io::Read, path::PathBuf, sync::Arc};
-
-use async_trait::async_trait;
+use etcd_client;
 use serde::{Deserialize, Serialize};
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use tokio::sync::Mutex;
@@ -53,28 +52,6 @@ fn get_kernel_image_path(kernel_name: &String, kernel_version: &String) -> VmMan
     }
 }
 
-/// Regulated basic functions that a Vm managing agent must have
-#[async_trait]
-pub trait VmManagePool {
-    /// Configuration type that is used to boot the machine
-    type ConfigType;
-    type MachineIdentifier;
-    async fn create_machine(
-        &mut self,
-        config: &Self::ConfigType,
-    ) -> VmManageResult<Self::MachineIdentifier>;
-
-    async fn start_machine(&self, vmid: &Self::MachineIdentifier) -> VmManageResult<()>;
-
-    async fn pause_machine(&self, vmid: &Self::MachineIdentifier) -> VmManageResult<()>;
-
-    async fn resume_machine(&self, vmid: &Self::MachineIdentifier) -> VmManageResult<()>;
-
-    async fn stop_machine(&self, vmid: &Self::MachineIdentifier) -> VmManageResult<()>;
-
-    async fn delete_machine(&mut self, vmid: &Self::MachineIdentifier) -> VmManageResult<()>;
-}
-
 #[allow(unused)]
 #[derive(sqlx::FromRow, Serialize, Deserialize, Debug, Clone)]
 pub struct PgMachineCoreElement {
@@ -99,162 +76,256 @@ pub struct PgSnapshotElement {
 }
 
 #[derive(Clone)]
-pub struct FirecrackerVmManagePool {
+pub struct VmManagePool {
     pool_id: Uuid,
     machines: BTreeMap<Uuid, Arc<Mutex<Machine>>>,
     conn: PgPool,
+    etcd_client: etcd_client::Client,
     storage_mgr_addr: String,
     storage_client: reqwest::Client,
 }
 
-#[async_trait]
-impl VmManagePool for FirecrackerVmManagePool {
-    type ConfigType = MachineCreateConfig;
-    type MachineIdentifier = Uuid;
-    async fn create_machine(&mut self, config: &MachineCreateConfig) -> VmManageResult<Uuid> {
-        /* Create a new vmid for the machine */
-        let vmid = Uuid::new_v4();
-        let socket_path = PathBuf::from(format!(
-            "{}{}.socket",
-            env::var("SOCKETS_DIR").map_err(|_| VmManageError::EnvironVarError("SOCKETS_DIR"))?,
-            vmid.to_string()
-        ));
-        let log_fifo = PathBuf::from(format!(
-            "{}{}.log",
-            env::var("LOGS_DIR").map_err(|_| VmManageError::EnvironVarError("LOGS_DIR"))?,
-            vmid.to_string()
-        ));
-        let metrics_fifo = PathBuf::from(format!(
-            "{}{}-metrics",
-            env::var("METRICS_DIR").map_err(|_| VmManageError::EnvironVarError("METRICS_DIR"))?,
-            vmid.to_string()
-        ));
-        let agent_init_timeout = env::var("AGENT_INIT_TIMEOUT")
-            .map_err(|_| VmManageError::EnvironVarError("AGENT_INIT_TIMEOUT"))?
-            .parse::<f64>()
-            .map_err(|_| VmManageError::EnvironVarError("AGENT_INIT_TIMEOUT"))?;
-        let agent_request_timeout = env::var("AGENT_INIT_TIMEOUT")
-            .map_err(|_| VmManageError::EnvironVarError("AGENT_REQUEST_TIMEOUT"))?
-            .parse::<f64>()
-            .map_err(|_| VmManageError::EnvironVarError("AGENT_REQUEST_TIMEOUT"))?;
+pub struct PoolGuard<'a> {
+    pub pool: &'a mut VmManagePool,
+    pub lock: Option<String>,
+}
 
-        /* Machine configuration for the microVM */
-        let machine_cfg = MachineConfiguration {
-            cpu_template: None,
-            ht_enabled: config.enable_hyperthreading,
-            mem_size_mib: config.memory_size_in_mib as isize,
-            track_dirty_pages: None,
-            vcpu_count: config.vcpu_count as isize,
-        };
-        let kernel_image_path = get_kernel_image_path(&config.kernel_name, &config.kernel_version)?;
-        
-        /* Request for a volume from storage manager */
-        let volume_id = self.create_volume(config.volume_size_in_mib, None).await?;
-        let volume_path = self.attach_volume(volume_id).await?;
-        /* Config the root device */
-        let root_device = Drive {
-            drive_id: "rootfs".to_string(),
-            partuuid: Some(volume_id.to_string()),
-            is_root_device: true,
-            cache_type: None,
-            is_read_only: false,
-            path_on_host: PathBuf::from(volume_path),
-            rate_limiter: None,
-            io_engine: None,
-            socket: None,
-        };
-
-        /* Add the creating config to database */
-        self.add_vm_config(&vmid, config).await?;
-
-        /* Build the config */
-        let config = Config {
-            socket_path: Some(socket_path),
-            log_fifo: Some(log_fifo),
-            log_path: None,
-            log_level: Some(LogLevel::Info),                    // Set log level to Info
-            log_clear: Some(false),                             // Keep log fifo
-            metrics_fifo: Some(metrics_fifo),
-            metrics_path: None,
-            metrics_clear: Some(false),                         // Keep metrics fifo
-            kernel_image_path: Some(kernel_image_path),
-            initrd_path: None,
-            kernel_args: None,
-            drives: Some(vec![root_device]),                    // Root device
-            network_interfaces: None,                           // TODO: network interface
-            vsock_devices: None,
-            machine_cfg: Some(machine_cfg),
-            disable_validation: true,                           // Enable validation
-            enable_jailer: false,                               // Disable jailer
-            jailer_cfg: None,
-            vmid: None,
-            net_ns: None,
-            network_clear: Some(true),
-            forward_signals: None,
-            seccomp_level: None,
-            mmds_address: None,
-            balloon: None,
-            init_metadata: config.initial_metadata.to_owned(),  // Initial metadata
-            stderr: None,
-            stdin: None,
-            stdout: None,
-            agent_init_timeout: Some(agent_init_timeout),
-            agent_request_timeout: Some(agent_request_timeout),
-        }; // Config
-
-        /* Create the machine */
-        let machine = Machine::new(config.to_owned())?;
-
-        /* Dump to machine core */
-        let core = machine.dump_into_core().map_err(|e| {
-            VmManageError::MachineError(format!("Fail to dump into MachineCore: {}", e))
-        })?;
-
-        /* add to memory */
-        self.machines.insert(vmid, Arc::new(Mutex::new(machine)));
-
-        /* add core to database */
-        self.add_core(&vmid, &core).await?;
-        
-        Ok(vmid)
-    }
-
-    async fn start_machine(&self, vmid: &Uuid) -> VmManageResult<()> {
-        let machine = self.machines.get(&vmid).ok_or(VmManageError::NotFound)?;
-        machine.lock().await.start().await?;
-        Ok(())
-    }
-
-    async fn pause_machine(&self, vmid: &Uuid) -> VmManageResult<()> {
-        let machine = self.machines.get(&vmid).ok_or(VmManageError::NotFound)?;
-        machine.lock().await.pause().await?;
-        Ok(())
-    }
-
-    async fn resume_machine(&self, vmid: &Uuid) -> VmManageResult<()> {
-        let machine = self.machines.get(&vmid).ok_or(VmManageError::NotFound)?;
-        machine.lock().await.resume().await?;
-        Ok(())
-    }
-
-    async fn stop_machine(&self, vmid: &Uuid) -> VmManageResult<()> {
-        let machine = self.machines.get(&vmid).ok_or(VmManageError::NotFound)?;
-        machine.lock().await.shutdown().await?;
-        machine.lock().await.stop_vmm().await?;
-        self.delete_core(vmid).await?;
-        Ok(())
-    }
-
-    async fn delete_machine(&mut self, vmid: &Uuid) -> VmManageResult<()> {
-        let machine = self.machines.remove(&vmid).ok_or(VmManageError::NotFound)?;
-        machine.lock().await.shutdown().await?;
-        machine.lock().await.stop_vmm().await?;
-        self.delete_core(vmid).await?;
-        Ok(())
+impl<'a> Drop for PoolGuard<'a> {
+    fn drop(&mut self) {
+        if let Some(lock) = self.lock.take() {
+            // release lock use Tokio spawn
+            let mut pool = self.pool.clone();
+            tokio::spawn(async move {
+                if let Err(e) = release_vm_lock(&mut pool, &lock).await {
+                    log::error!("Failed to release lock {}: {}", lock, e);
+                }
+            });
+        }
     }
 }
 
-impl FirecrackerVmManagePool {
+impl<'a> PoolGuard<'a> {
+    pub fn new(pool: &mut VmManagePool, lock: String) -> PoolGuard {
+        PoolGuard {
+            pool,
+            lock: Some(lock),
+        }
+    }
+
+    pub fn pool(&mut self) -> &mut VmManagePool {
+        self.pool
+    }
+}
+
+/// Use ETCd distributed lock to get vm lock
+/// This lock will have a lease, default to 30s
+pub async fn get_vm_lock(pool: &mut VmManagePool, vmid: &Uuid, lease: Option<i64>) -> VmManageResult<String> {
+    let lock_name = format!("/lock/vm/{}", vmid);
+    let lock_global = format!("/lock/vm/global");
+
+    log::trace!("Getting lock for vm {}", vmid);
+
+    let resp = pool.etcd_client.lease_grant(lease.unwrap_or(120), None).await?;
+    let lease_id = resp.id();
+    let lock_options = etcd_client::LockOptions::new().with_lease(lease_id);
+
+    // Acquire global lock
+    let _ = pool.etcd_client.lock(lock_global.clone(), None);
+
+    let resp = pool.etcd_client.lock(lock_name, Some(lock_options)).await?;
+    let key = resp.key();
+    let key_str = std::str::from_utf8(key).unwrap().to_owned();
+
+    // Release global lock
+    pool.etcd_client.unlock(lock_global).await?;
+
+    log::trace!("Got lock {} for vm {}", key_str, vmid);
+
+    Ok(key_str)
+}
+
+pub async fn get_global_lock(pool: &mut VmManagePool, lease: Option<i64>) -> VmManageResult<String> {
+    let lock_name = format!("/lock/vm/global");
+
+    log::trace!("Getting lock for global");
+
+    let resp = pool.etcd_client.lease_grant(lease.unwrap_or(120), None).await?;
+    let lease_id = resp.id();
+    let lock_options = etcd_client::LockOptions::new().with_lease(lease_id);
+
+    let resp = pool.etcd_client.lock(lock_name, Some(lock_options)).await?;
+    let key = resp.key();
+    let key_str = std::str::from_utf8(key).unwrap().to_owned();
+
+    log::trace!("Got global lock");
+
+    Ok(key_str)
+}
+
+pub async fn release_vm_lock(pool: &mut VmManagePool, lock: &str) -> VmManageResult<()> {
+    log::trace!("Releasing lock {}", lock);
+
+    pool.etcd_client.unlock(lock).await?;
+    Ok(())
+}
+
+pub async fn check_init_pool(pool: VmManagePool) -> VmManageResult<VmManagePool> {
+    todo!()
+}
+
+pub async fn get_vm(pool: &mut VmManagePool, vmid: Uuid) -> VmManageResult<()> {
+    todo!()
+}
+
+pub async fn create_vm(pool: &mut VmManagePool, config: &MachineCreateConfig) -> VmManageResult<Uuid> {
+    let vmid = Uuid::new_v4();
+    let socket_path = PathBuf::from(format!(
+        "{}{}.socket",
+        env::var("SOCKETS_DIR").map_err(|_| VmManageError::EnvironVarError("SOCKETS_DIR"))?,
+        vmid.to_string()
+    ));
+    let log_fifo = PathBuf::from(format!(
+        "{}{}.log",
+        env::var("LOGS_DIR").map_err(|_| VmManageError::EnvironVarError("LOGS_DIR"))?,
+        vmid.to_string()
+    ));
+    let metrics_fifo = PathBuf::from(format!(
+        "{}{}-metrics",
+        env::var("METRICS_DIR").map_err(|_| VmManageError::EnvironVarError("METRICS_DIR"))?,
+        vmid.to_string()
+    ));
+    let agent_init_timeout = env::var("AGENT_INIT_TIMEOUT")
+        .map_err(|_| VmManageError::EnvironVarError("AGENT_INIT_TIMEOUT"))?
+        .parse::<f64>()
+        .map_err(|_| VmManageError::EnvironVarError("AGENT_INIT_TIMEOUT"))?;
+    let agent_request_timeout = env::var("AGENT_INIT_TIMEOUT")
+        .map_err(|_| VmManageError::EnvironVarError("AGENT_REQUEST_TIMEOUT"))?
+        .parse::<f64>()
+        .map_err(|_| VmManageError::EnvironVarError("AGENT_REQUEST_TIMEOUT"))?;
+
+    /* Machine configuration for the microVM */
+    let machine_cfg = MachineConfiguration {
+        cpu_template: None,
+        ht_enabled: config.enable_hyperthreading,
+        mem_size_mib: config.memory_size_in_mib as isize,
+        track_dirty_pages: None,
+        vcpu_count: config.vcpu_count as isize,
+    };
+    let kernel_image_path = get_kernel_image_path(&config.kernel_name, &config.kernel_version)?;
+    
+    /* Request for a volume from storage manager */
+    let volume_id = pool.create_volume(config.volume_size_in_mib, None).await?;
+    let volume_path = pool.attach_volume(volume_id).await?;
+    /* Config the root device */
+    let root_device = Drive {
+        drive_id: "rootfs".to_string(),
+        partuuid: Some(volume_id.to_string()),
+        is_root_device: true,
+        cache_type: None,
+        is_read_only: false,
+        path_on_host: PathBuf::from(volume_path),
+        rate_limiter: None,
+        io_engine: None,
+        socket: None,
+    };
+
+    /* Add the creating config to database */
+    pool.add_vm_config(&vmid, config).await?;
+
+    /* Build the config */
+    let config = Config {
+        socket_path: Some(socket_path),
+        log_fifo: Some(log_fifo),
+        log_path: None,
+        log_level: Some(LogLevel::Info),                    // Set log level to Info
+        log_clear: Some(false),                             // Keep log fifo
+        metrics_fifo: Some(metrics_fifo),
+        metrics_path: None,
+        metrics_clear: Some(false),                         // Keep metrics fifo
+        kernel_image_path: Some(kernel_image_path),
+        initrd_path: None,
+        kernel_args: None,
+        drives: Some(vec![root_device]),                    // Root device
+        network_interfaces: None,                           // TODO: network interface
+        vsock_devices: None,
+        machine_cfg: Some(machine_cfg),
+        disable_validation: true,                           // Enable validation
+        enable_jailer: false,                               // Disable jailer
+        jailer_cfg: None,
+        vmid: None,
+        net_ns: None,
+        network_clear: Some(true),
+        forward_signals: None,
+        seccomp_level: None,
+        mmds_address: None,
+        balloon: None,
+        init_metadata: config.initial_metadata.to_owned(),  // Initial metadata
+        stderr: None,
+        stdin: None,
+        stdout: None,
+        agent_init_timeout: Some(agent_init_timeout),
+        agent_request_timeout: Some(agent_request_timeout),
+    }; // Config
+
+    /* Create the machine */
+    let machine = Machine::new(config.to_owned())?;
+
+    /* Dump to machine core */
+    let core = machine.dump_into_core().map_err(|e| {
+        VmManageError::MachineError(format!("Fail to dump into MachineCore: {}", e))
+    })?;
+
+    /* add to memory */
+    pool.machines.insert(vmid, Arc::new(Mutex::new(machine)));
+
+    /* add core to database */
+    pool.add_core(&vmid, &core).await?;
+    
+    Ok(vmid)
+}
+
+pub async fn start_vm(pool: &mut VmManagePool, vmid: Uuid) -> VmManageResult<()> {
+    let machine = pool.machines.get(&vmid).ok_or(VmManageError::NotFound)?;
+    let mut machine = machine.lock().await;
+    machine.start().await?;
+    Ok(())
+}
+
+pub async fn pause_vm(pool: &mut VmManagePool, vmid: Uuid) -> VmManageResult<()> {
+    let machine = pool.machines.get(&vmid).ok_or(VmManageError::NotFound)?;
+    let machine = machine.lock().await;
+    machine.pause().await?;
+    Ok(())
+}
+
+pub async fn resume_vm(pool: &mut VmManagePool, vmid: Uuid) -> VmManageResult<()> {
+    let machine = pool.machines.get(&vmid).ok_or(VmManageError::NotFound)?;
+    let machine = machine.lock().await;
+    machine.resume().await?;
+    Ok(())
+}
+
+pub async fn stop_vm(pool: &mut VmManagePool, vmid: Uuid) -> VmManageResult<()> {
+    let machine = pool.machines.get(&vmid).ok_or(VmManageError::NotFound)?;
+    let mut machine = machine.lock().await;
+    machine.shutdown().await?;
+    machine.stop_vmm().await?;
+    drop(machine);
+    pool.delete_core(&vmid).await?;
+    Ok(())
+}
+
+pub async fn delete_vm(pool: &mut VmManagePool, vmid: Uuid) -> VmManageResult<()> {
+    let machine = pool.machines.remove(&vmid).ok_or(VmManageError::NotFound)?;
+    let mut machine = machine.lock().await;
+    machine.shutdown().await?;
+    machine.stop_vmm().await?;
+    drop(machine);
+    pool.delete_core(&vmid).await?;
+    Ok(())
+}
+
+impl VmManagePool {
     pub async fn new(pool_id: Uuid) -> VmManageResult<Self> {
         dotenv::dotenv().ok();
         let database_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
@@ -262,6 +333,12 @@ impl FirecrackerVmManagePool {
         let database_password =
             env::var("DATABASE_PASSWORD").expect("DATABASE_PASSWORD must be set");
         let database_name = env::var("DATABASE_NAME").expect("DATABASE_NAME must be set");
+        
+        let etcd_url = env::var("ETCD_URL").expect("ETCD_URL must be set");
+        let etcd_user = env::var("ETCD_USER").expect("ETCD_USER must be set");
+        let etcd_password = env::var("ETCD_PASSWORD").expect("ETCD_PASSWORD must be set");
+        let etcd_prefix = env::var("ETCD_PREFIX").expect("ETCD_PREFIX must be set");
+
         let storage_mgr_addr = env::var("STORAGE_MGR_ADDR").expect("STORAGE_MGR_ADDR must be set");
 
         let database_url = format!(
@@ -277,10 +354,14 @@ impl FirecrackerVmManagePool {
 
         let storage_client = reqwest::Client::new();
 
+        let etcd_config = etcd_client::ConnectOptions::new().with_user(etcd_user, etcd_password);
+        let etcd_client = etcd_client::Client::connect([etcd_url], Some(etcd_config)).await?;
+
         let pool = Self {
             pool_id,
             machines: BTreeMap::new(),
             conn,
+            etcd_client,
             storage_mgr_addr,
             storage_client,
         };
@@ -315,10 +396,29 @@ impl FirecrackerVmManagePool {
             .await?;
         Ok(pool)
     }
+
+    /// Lock vm by vmid
+    pub async fn lock(&mut self, vmid: &Uuid) -> VmManageResult<PoolGuard> {
+        let lock = get_vm_lock(self, vmid, None).await?;
+        Ok(PoolGuard {
+            pool: self,
+            lock: Some(lock),
+        })
+    }
+
+    /// Global lock 
+    pub async fn lock_global(&mut self) -> VmManageResult<PoolGuard> {
+        let lock = String::from("global");
+        Ok(PoolGuard {
+            pool: self,
+            lock: Some(lock),
+        })
+    }
 }
 
 /// Postgresql related methods
-impl FirecrackerVmManagePool {
+/// No lock
+impl VmManagePool {
     #[inline]
     fn machine_core_storage_table(&self) -> String {
         format!(
@@ -453,88 +553,119 @@ impl FirecrackerVmManagePool {
     }
 }
 
-impl FirecrackerVmManagePool {
-    pub async fn restore_all(&mut self) -> VmManageResult<Vec<VmViewInfo>> {
-        let machine_core_storage_table = self.machine_core_storage_table();
-        let elements = sqlx::query_as::<_, PgMachineCoreElement>("SELECT * FROM $1")
-            .bind(machine_core_storage_table)
-            .fetch_all(&self.conn)
-            .await?;
+/// Try to restore all machines of the original pool.
+/// Return vmids that fail to restore.
+pub async fn restore_all(pool: &mut VmManagePool) -> VmManageResult<Vec<Uuid>> {
+    let machine_core_storage_table = pool.machine_core_storage_table();
+    let elements = sqlx::query_as::<_, PgMachineCoreElement>("SELECT * FROM $1")
+        .bind(machine_core_storage_table)
+        .fetch_all(&pool.conn)
+        .await?;
 
-        let mut res = Vec::new();
+    let mut res: Vec<Uuid> = Vec::new();
 
-        for element in elements {
-            let vmid = element.vmid;
-            let core = element.machine_core.0;
-            let mut machine = Machine::rebuild(core)?;
+    for element in elements {
+        let vmid = element.vmid;
+        let core = element.machine_core.0;
+        let machine = Machine::rebuild(core)?;
 
-            // Check whether the machine is still alive
-            let vm_info = machine.describe_instance_info().await;
-            let full_config = machine.get_export_vm_config().await;
-            let config = machine.get_config();
+        // Check whether the machine is still alive
+        let vm_info = machine.describe_instance_info().await;
 
-            if vm_info.is_ok() && full_config.is_ok() {
-                // machine still alive
-                res.push(VmViewInfo {
-                    vmid,
-                    vm_info: vm_info.unwrap(),
-                    full_config: full_config.unwrap(),
-                    boot_config: config,
-                })
-            } else {
-                // machine crushed
-                res.push(VmViewInfo {
-                    vmid,
-                    vm_info: InstanceInfo {
-                        app_name: String::new(),
-                        id: String::new(),
-                        state: rustcracker::model::instance_info::State::NotStarted,
-                        vmm_version: String::new(),
-                    },
-                    full_config: FullVmConfiguration::default(),
-                    boot_config: Config::default(),
-                })
-            }
-
-            self.machines
-                .insert(element.vmid, Arc::new(Mutex::new(machine)));
+        if vm_info.is_err() {
+            res.push(vmid);
         }
 
-        Ok(res)
+        // Global lock required
+        pool.machines.insert(element.vmid, Arc::new(Mutex::new(machine)));
     }
 
-    pub async fn get_status(&self, vmid: &Uuid) -> VmManageResult<VmViewInfo> {
-        if let Some(machine) = self.machines.get(vmid) {
-            let mut machine = machine.lock().await;
-            let vm_info = machine.describe_instance_info().await?;
-            let config = machine.get_config();
-            let full_config = machine.get_export_vm_config().await?;
+    Ok(res)
+}
 
-            Ok(VmViewInfo {
-                vmid: vmid.to_owned(),
-                vm_info,
-                full_config,
-                boot_config: config,
-            })
-        } else {
-            Err(VmManageError::NotFound)
-        }
-    }
+pub async fn get_status(pool: &mut VmManagePool, vmid: Uuid) -> VmManageResult<VmViewInfo> {
+    if let Some(machine) = pool.machines.get(&vmid) {
+        let mut machine = machine.lock().await;
+        let vm_info = machine.describe_instance_info().await?;
+        let config = machine.get_config();
+        let full_config = machine.get_export_vm_config().await?;
 
-    pub async fn modify_metadata(&self, vmid: &Uuid, metadata: &String) -> VmManageResult<()> {
-        if let Some(machine) = self.machines.get(vmid) {
-            let machine = machine.lock().await;
-            machine.update_metadata(metadata).await?;
-
-            Ok(())
-        } else {
-            Err(VmManageError::NotFound)
-        }
+        Ok(VmViewInfo {
+            vmid: vmid.to_owned(),
+            vm_info,
+            full_config,
+            boot_config: config,
+        })
+    } else {
+        Err(VmManageError::NotFound)
     }
 }
 
+pub async fn modify_metadata(pool: &mut VmManagePool, vmid: Uuid, metadata: &String) -> VmManageResult<()> {
+    if let Some(machine) = pool.machines.get(&vmid) {
+        let mut machine = machine.lock().await;
+        machine.update_metadata(metadata).await?;
+        Ok(())
+    } else {
+        Err(VmManageError::NotFound)
+    }
+}
+
+pub async fn create_snapshot(pool: &mut VmManagePool, vmid: Uuid) -> VmManageResult<Uuid> {
+    let vm_mem_snapshot_dir = env::var("MEMORY_SNAPSHOT_DIR")
+        .map_err(|_| VmManageError::EnvironVarError("MEMORY_SNAPSHOT_DIR"))?;
+    if let Some(machine) = pool.machines.get(&vmid) {
+        
+        let snapshot_id = Uuid::new_v4();
+        let cur_dir = PathBuf::from(vm_mem_snapshot_dir)
+            .join(vmid.to_string())
+            .join(snapshot_id.to_string());
+        let mem_file_path = &cur_dir.join("mem");
+        let snapshot_path = &cur_dir.join("vm");
+        let machine = machine.lock().await;
+        machine
+            .create_snapshot(mem_file_path, snapshot_path)
+            .await?;
+        drop(machine);
+        // store into database
+        pool.add_vm_mem_snapshot(
+            &vmid,
+            &snapshot_id,
+            &mem_file_path.to_string_lossy().to_string(),
+            &snapshot_path.to_string_lossy().to_string(),
+        )
+        .await?;
+        Ok(snapshot_id)
+    } else {
+        Err(VmManageError::NotFound)
+    }
+}
+
+pub async fn delete_snapshot(pool: &mut VmManagePool, vmid: Uuid, snapshot_id: Uuid) -> VmManageResult<()> {
+    let vm_mem_snapshot_dir = env::var("MEMORY_SNAPSHOT_DIR")
+        .map_err(|_| VmManageError::EnvironVarError("MEMORY_SNAPSHOT_DIR"))?;
+    let cur_dir = PathBuf::from(vm_mem_snapshot_dir)
+        .join(vmid.to_string())
+        .join(snapshot_id.to_string());
+    if let Ok(_) = tokio::fs::remove_dir_all(cur_dir).await {
+        // delete from database
+        pool.delete_vm_mem_snapshot(&vmid, &snapshot_id).await?;
+        Ok(())
+    } else {
+        Err(VmManageError::NotFound)
+    }
+}
+
+pub async fn get_snapshot_detail(
+    pool: &mut VmManagePool,
+    vmid: &Uuid,
+    snapshot_id: &Uuid,
+) -> VmManageResult<Vec<PgSnapshotElement>> {
+    pool.get_vm_mem_snapshot_detail(vmid, snapshot_id).await
+}
+
 /// RPC to storage management (naive with http)
-impl FirecrackerVmManagePool {
+impl VmManagePool {
     async fn create_volume(&self, size: i32, parent: Option<Uuid>) -> VmManageResult<Uuid> {
         let url = format!("{}{}", self.storage_mgr_addr, "/api/v1/volume");
         let req = VolumeCreateRequest { size, parent };
@@ -625,60 +756,6 @@ impl FirecrackerVmManagePool {
 }
 
 /// RPC to network management (naive with http)
-impl FirecrackerVmManagePool {
+impl VmManagePool {
 
-}
-
-/// Implementations for creating vm status and memory snapshots
-impl FirecrackerVmManagePool {
-    pub async fn create_snapshot(&self, vmid: &Uuid) -> VmManageResult<Uuid> {
-        let vm_mem_snapshot_dir = env::var("MEMORY_SNAPSHOT_DIR")
-            .map_err(|_| VmManageError::EnvironVarError("MEMORY_SNAPSHOT_DIR"))?;
-        if let Some(machine) = self.machines.get(vmid) {
-            let snapshot_id = Uuid::new_v4();
-            let machine = machine.lock().await;
-            let cur_dir = PathBuf::from(vm_mem_snapshot_dir)
-                .join(vmid.to_string())
-                .join(snapshot_id.to_string());
-            let mem_file_path = &cur_dir.join("mem");
-            let snapshot_path = &cur_dir.join("vm");
-            machine
-                .create_snapshot(mem_file_path, snapshot_path)
-                .await?;
-            // store into database
-            self.add_vm_mem_snapshot(
-                &vmid,
-                &snapshot_id,
-                &mem_file_path.to_string_lossy().to_string(),
-                &snapshot_path.to_string_lossy().to_string(),
-            )
-            .await?;
-            Ok(snapshot_id)
-        } else {
-            Err(VmManageError::NotFound)
-        }
-    }
-
-    pub async fn delete_snapshot(&self, vmid: &Uuid, snapshot_id: &Uuid) -> VmManageResult<()> {
-        let vm_mem_snapshot_dir = env::var("MEMORY_SNAPSHOT_DIR")
-            .map_err(|_| VmManageError::EnvironVarError("MEMORY_SNAPSHOT_DIR"))?;
-        let cur_dir = PathBuf::from(vm_mem_snapshot_dir)
-            .join(vmid.to_string())
-            .join(snapshot_id.to_string());
-        if let Ok(_) = tokio::fs::remove_dir_all(cur_dir).await {
-            // delete from database
-            self.delete_vm_mem_snapshot(vmid, &snapshot_id).await?;
-            Ok(())
-        } else {
-            Err(VmManageError::NotFound)
-        }
-    }
-
-    pub async fn get_snapshot_detail(
-        &self,
-        vmid: &Uuid,
-        snapshot_id: &Uuid,
-    ) -> VmManageResult<Vec<PgSnapshotElement>> {
-        self.get_vm_mem_snapshot_detail(vmid, snapshot_id).await
-    }
 }

@@ -2,7 +2,7 @@ use std::{default, env, sync::Mutex};
 
 use actix_web::{web, App, HttpServer};
 use dotenv::dotenv;
-use pikacloud_vm_manage_mgr::{handler::*, machine_pool::FirecrackerVmManagePool};
+use pikacloud_vm_manage_mgr::{handler::*, machine_pool::VmManagePool};
 
 use uuid::Uuid;
 
@@ -13,7 +13,7 @@ async fn main() -> std::io::Result<()> {
 
     log4rs::init_file("log4rs.yaml", default::Default::default()).unwrap();
 
-    let pool = FirecrackerVmManagePool::new(Uuid::new_v4())
+    let pool = VmManagePool::new(Uuid::new_v4())
         .await
         .map_err(|e| {
             eprintln!("Fail to build a vm pool: {}", e.to_string());
@@ -44,8 +44,6 @@ async fn main() -> std::io::Result<()> {
             .service(modify_metadata_handler)
             .service(operate_machine_handler)
             .service(delete_machine_handler)
-            .service(get_snapshot_detail_handler)
-            .service(create_snapshot_handler)
             .service(attach_volume_to_machine_handler)
             .service(delete_volume_from_machine_handler)
             .service(restore_all_machines_from_core)
