@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, env, path::PathBuf, sync::Arc};
+use std::{collections::BTreeMap, env, io::Read, path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -8,11 +8,7 @@ use uuid::Uuid;
 
 use crate::{
     error::{VmManageError, VmManageResult},
-    models::{
-        MachineCreateConfig, VmViewInfo, DEFAULT_MACHINE_CORE_TABLE, DEFAULT_VM_CONFIG_TABLE,
-        DEFAULT_VM_MEM_SNAPSHOT_TABLE, MACHINE_CORE_TABLE_NAME, VM_CONFIG_TABLE_NAME,
-        VM_MEM_SNAPSHOT_TABLE_NAME,
-    },
+    models::*,
     storage_models::{
         SnapshotCreateRequest, SnapshotCreateResponse, SnapshotDeleteRequest, VolumeAttachRequest,
         VolumeAttachResponse, VolumeCreateRequest, VolumeCreateResponse, VolumeDeleteRequest,
@@ -27,10 +23,34 @@ use rustcracker::{
     },
 };
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct KernelItem {
+    kernel_name: String,
+    kernel_version: String,
+    path: String,
+}
+
+// Get kernel image paths from a configuration file
+// re-get every time to ensure dynamic modification
 fn get_kernel_image_path(kernel_name: &String, kernel_version: &String) -> VmManageResult<PathBuf> {
-    let kernel_dir =
-        env::var("KERNELS_DIR").map_err(|_| VmManageError::EnvironVarError("KERNELS_DIR"))?;
-    todo!()
+    let kernel_list_file =
+        env::var("KERNEL_LIST_FILE").map_err(|_| VmManageError::EnvironVarError("KERNEL_LIST_FILE"))?;
+    let mut f = std::fs::File::open(kernel_list_file)?;
+    let mut buf = String::new();
+    f.read_to_string(&mut buf)?;
+
+    let list: Vec<KernelItem> = serde_json::from_str(&buf)?;
+    let mut path: Option<String> = None;
+    for e in &list {
+        if &e.kernel_name == kernel_name && &e.kernel_version == kernel_version {
+            path = Some(e.path.to_owned());
+            break;
+        }
+    }
+    match path {
+        Some(path) => Ok(PathBuf::from(path)),
+        None => Err(VmManageError::NotFound),
+    }
 }
 
 /// Regulated basic functions that a Vm managing agent must have
@@ -87,51 +107,25 @@ pub struct FirecrackerVmManagePool {
     storage_client: reqwest::Client,
 }
 
-pub struct FirecrackerVmManagePoolGuard<'a> {
-    pub pool: &'a mut FirecrackerVmManagePool,
-    pub lock: Option<String>,
-}
-
-impl<'a> Drop for FirecrackerVmManagePoolGuard<'a> {
-    fn drop(&mut self) {
-        if let Some(lock) = self.lock.take() {
-            // release lock
-            self.lock = None
-        }
-    }
-}
-
-impl<'a> FirecrackerVmManagePoolGuard<'a> {
-    pub fn new(pool: &mut FirecrackerVmManagePool, lock: String) -> FirecrackerVmManagePoolGuard {
-        FirecrackerVmManagePoolGuard {
-            pool,
-            lock: Some(lock),
-        }
-    }
-
-    pub fn pool(&mut self) -> &mut FirecrackerVmManagePool {
-        self.pool
-    }
-}
-
 #[async_trait]
 impl VmManagePool for FirecrackerVmManagePool {
     type ConfigType = MachineCreateConfig;
     type MachineIdentifier = Uuid;
     async fn create_machine(&mut self, config: &MachineCreateConfig) -> VmManageResult<Uuid> {
+        /* Create a new vmid for the machine */
         let vmid = Uuid::new_v4();
         let socket_path = PathBuf::from(format!(
-            "{}{}",
+            "{}{}.socket",
             env::var("SOCKETS_DIR").map_err(|_| VmManageError::EnvironVarError("SOCKETS_DIR"))?,
             vmid.to_string()
         ));
         let log_fifo = PathBuf::from(format!(
-            "{}{}",
+            "{}{}.log",
             env::var("LOGS_DIR").map_err(|_| VmManageError::EnvironVarError("LOGS_DIR"))?,
             vmid.to_string()
         ));
         let metrics_fifo = PathBuf::from(format!(
-            "{}{}",
+            "{}{}-metrics",
             env::var("METRICS_DIR").map_err(|_| VmManageError::EnvironVarError("METRICS_DIR"))?,
             vmid.to_string()
         ));
@@ -143,6 +137,8 @@ impl VmManagePool for FirecrackerVmManagePool {
             .map_err(|_| VmManageError::EnvironVarError("AGENT_REQUEST_TIMEOUT"))?
             .parse::<f64>()
             .map_err(|_| VmManageError::EnvironVarError("AGENT_REQUEST_TIMEOUT"))?;
+
+        /* Machine configuration for the microVM */
         let machine_cfg = MachineConfiguration {
             cpu_template: None,
             ht_enabled: config.enable_hyperthreading,
@@ -151,8 +147,11 @@ impl VmManagePool for FirecrackerVmManagePool {
             vcpu_count: config.vcpu_count as isize,
         };
         let kernel_image_path = get_kernel_image_path(&config.kernel_name, &config.kernel_version)?;
+        
+        /* Request for a volume from storage manager */
         let volume_id = self.create_volume(config.volume_size_in_mib, None).await?;
         let volume_path = self.attach_volume(volume_id).await?;
+        /* Config the root device */
         let root_device = Drive {
             drive_id: "rootfs".to_string(),
             partuuid: Some(volume_id.to_string()),
@@ -164,24 +163,29 @@ impl VmManagePool for FirecrackerVmManagePool {
             io_engine: None,
             socket: None,
         };
+
+        /* Add the creating config to database */
+        self.add_vm_config(&vmid, config).await?;
+
+        /* Build the config */
         let config = Config {
             socket_path: Some(socket_path),
             log_fifo: Some(log_fifo),
             log_path: None,
-            log_level: Some(LogLevel::Debug),
-            log_clear: Some(false),
+            log_level: Some(LogLevel::Info),                    // Set log level to Info
+            log_clear: Some(false),                             // Keep log fifo
             metrics_fifo: Some(metrics_fifo),
             metrics_path: None,
-            metrics_clear: Some(false),
+            metrics_clear: Some(false),                         // Keep metrics fifo
             kernel_image_path: Some(kernel_image_path),
             initrd_path: None,
             kernel_args: None,
-            drives: Some(vec![root_device]),
-            network_interfaces: None,
+            drives: Some(vec![root_device]),                    // Root device
+            network_interfaces: None,                           // TODO: network interface
             vsock_devices: None,
             machine_cfg: Some(machine_cfg),
-            disable_validation: false,
-            enable_jailer: false,
+            disable_validation: true,                           // Enable validation
+            enable_jailer: false,                               // Disable jailer
             jailer_cfg: None,
             vmid: None,
             net_ns: None,
@@ -190,23 +194,28 @@ impl VmManagePool for FirecrackerVmManagePool {
             seccomp_level: None,
             mmds_address: None,
             balloon: None,
-            init_metadata: config.initial_metadata.to_owned(),
+            init_metadata: config.initial_metadata.to_owned(),  // Initial metadata
             stderr: None,
             stdin: None,
             stdout: None,
             agent_init_timeout: Some(agent_init_timeout),
             agent_request_timeout: Some(agent_request_timeout),
-        };
+        }; // Config
+
+        /* Create the machine */
         let machine = Machine::new(config.to_owned())?;
 
+        /* Dump to machine core */
         let core = machine.dump_into_core().map_err(|e| {
             VmManageError::MachineError(format!("Fail to dump into MachineCore: {}", e))
         })?;
-        // add to memory
-        self.machines.insert(vmid, Arc::new(Mutex::new(machine)));
-        // add core to database
-        self.add_core(&vmid, &core).await?;
 
+        /* add to memory */
+        self.machines.insert(vmid, Arc::new(Mutex::new(machine)));
+
+        /* add core to database */
+        self.add_core(&vmid, &core).await?;
+        
         Ok(vmid)
     }
 
@@ -267,18 +276,50 @@ impl FirecrackerVmManagePool {
             .await?;
 
         let storage_client = reqwest::Client::new();
-        Ok(Self {
+
+        let pool = Self {
             pool_id,
             machines: BTreeMap::new(),
             conn,
             storage_mgr_addr,
             storage_client,
-        })
+        };
+
+        /* Create tables for storing */
+        // machine core
+        sqlx::query(DROP_MAHCINE_CORE_TABLE_SQL)
+            .bind(pool.machine_core_storage_table())
+            .execute(&pool.conn)
+            .await?;
+        sqlx::query(CREATE_MACHINE_CORE_TABLE_SQL)
+            .bind(pool.machine_core_storage_table())
+            .execute(&pool.conn)
+            .await?;
+        // vm, mem snapshots
+        sqlx::query(DROP_VM_MEM_SNAPSHOT_TABLE_SQL)
+            .bind(pool.vm_mem_snapshot_storage_table())
+            .execute(&pool.conn)
+            .await?;
+        sqlx::query(CREATE_VM_MEM_SNAPSHOT_TABLE_SQL)
+            .bind(pool.vm_mem_snapshot_storage_table())
+            .execute(&pool.conn)
+            .await?;
+        // vm configs
+        sqlx::query(DROP_VMVIEWCONFIGS_TABLE_SQL)
+            .bind(pool.config_storage_table())
+            .execute(&pool.conn)
+            .await?;
+        sqlx::query(CREATE_VMVIEWCONFIGS_TABLE_SQL)
+            .bind(pool.config_storage_table())
+            .execute(&pool.conn)
+            .await?;
+        Ok(pool)
     }
 }
 
-/// Util methods
+/// Postgresql related methods
 impl FirecrackerVmManagePool {
+    #[inline]
     fn machine_core_storage_table(&self) -> String {
         format!(
             "{}_{}",
@@ -288,7 +329,7 @@ impl FirecrackerVmManagePool {
         )
     }
 
-    #[allow(unused)]
+    #[inline]
     fn config_storage_table(&self) -> String {
         format!(
             "{}_{}",
@@ -297,7 +338,7 @@ impl FirecrackerVmManagePool {
         )
     }
 
-    #[allow(unused)]
+    #[inline]
     fn vm_mem_snapshot_storage_table(&self) -> String {
         format!(
             "{}_{}",
@@ -309,7 +350,7 @@ impl FirecrackerVmManagePool {
 
     async fn add_core(&self, vmid: &Uuid, core: &MachineCore) -> VmManageResult<()> {
         let machine_core_storage_table = self.machine_core_storage_table();
-        sqlx::query("INSERT INTO $1 (vmid, machine_core) VALUES ($2, $3)")
+        sqlx::query(INSERT_MACHINE_CORE_BY_VMID)
             .bind(machine_core_storage_table)
             .bind(vmid)
             .bind(sqlx::types::Json(core.to_owned()))
@@ -321,7 +362,7 @@ impl FirecrackerVmManagePool {
 
     async fn delete_core(&self, vmid: &Uuid) -> VmManageResult<()> {
         let machine_core_storage_table = self.machine_core_storage_table();
-        sqlx::query("DELETE * FROM $1 WHERE vmid = $2")
+        sqlx::query(DELETE_MACHINE_CORE_BY_VMID)
             .bind(machine_core_storage_table)
             .bind(vmid)
             .execute(&self.conn)
@@ -337,7 +378,7 @@ impl FirecrackerVmManagePool {
         snapshot_path: &String,
     ) -> VmManageResult<()> {
         let vm_mem_snapshot_storage_table = self.vm_mem_snapshot_storage_table();
-        sqlx::query("INSERT INTO $1 (vmid, snapshot_id, mem_file_path, snapshot_path) VALUES ($2, $3, $4, %5)")
+        sqlx::query(INSERT_VM_MEM_SNAPSHOT_BY_ID)
             .bind(vm_mem_snapshot_storage_table)
             .bind(vmid)
             .bind(snapshot_id)
@@ -351,7 +392,7 @@ impl FirecrackerVmManagePool {
 
     async fn delete_vm_mem_snapshot(&self, vmid: &Uuid, snapshot_id: &Uuid) -> VmManageResult<()> {
         let vm_mem_snapshot_storage_table = self.vm_mem_snapshot_storage_table();
-        sqlx::query("DELETE * FROM $1 WHERE vmid = $2 AND snapshot_id = $3")
+        sqlx::query(DELETE_VM_MEM_SNAPSHOT_BY_ID)
             .bind(vm_mem_snapshot_storage_table)
             .bind(vmid)
             .bind(snapshot_id)
@@ -361,22 +402,54 @@ impl FirecrackerVmManagePool {
         Ok(())
     }
 
-    async fn get_detail_vm_mem_snapshot(
+    async fn get_vm_mem_snapshot_detail(
         &self,
         vmid: &Uuid,
         snapshot_id: &Uuid,
     ) -> VmManageResult<Vec<PgSnapshotElement>> {
         let vm_mem_snapshot_storage_table = self.vm_mem_snapshot_storage_table();
-        let list = sqlx::query_as::<_, PgSnapshotElement>(
-            "DELETE * FROM $1 WHERE vmid = $2 AND snapshot_id = $3",
-        )
-        .bind(vm_mem_snapshot_storage_table)
+        let list = sqlx::query_as::<_, PgSnapshotElement>(GET_VM_MEM_SNAPSHOT_BY_ID)
+            .bind(vm_mem_snapshot_storage_table)
+            .bind(vmid)
+            .bind(snapshot_id)
+            .fetch_all(&self.conn)
+            .await?;
+
+        Ok(list)
+    }
+
+    async fn add_vm_config(&self, vmid: &Uuid, config: &MachineCreateConfig) -> VmManageResult<()> {
+        let config_storage_table = self.config_storage_table();
+        sqlx::query(INSERT_VMVIEWCONFIGS_BY_VMID)
+        .bind(config_storage_table)
         .bind(vmid)
-        .bind(snapshot_id)
+        .bind(sqlx::types::Json(config))
+        .execute(&self.conn)
+        .await?;
+
+        Ok(())
+    }
+
+    async fn delete_vm_config(&self, vmid: &Uuid) -> VmManageResult<()> {
+        let config_storage_table = self.config_storage_table();
+        sqlx::query(DELETE_VMVIEWCONFIGS_BY_VMID)
+        .bind(config_storage_table)
+        .bind(vmid)
+        .execute(&self.conn)
+        .await?;
+
+        Ok(())
+    }
+
+    async fn get_vm_config_detail(&self, vmid: &Uuid) -> VmManageResult<Vec<PgVmConfigElement>> {
+        let config_storage_table = self.config_storage_table();
+        let elements = sqlx::query_as::<_, PgVmConfigElement>(GET_VMVIEWCONFIGS_BY_VMID)
+        .bind(config_storage_table)
+        .bind(vmid)
         .fetch_all(&self.conn)
         .await?;
 
-        Ok(list)
+        Ok(elements)
     }
 }
 
@@ -551,6 +624,11 @@ impl FirecrackerVmManagePool {
     }
 }
 
+/// RPC to network management (naive with http)
+impl FirecrackerVmManagePool {
+
+}
+
 /// Implementations for creating vm status and memory snapshots
 impl FirecrackerVmManagePool {
     pub async fn create_snapshot(&self, vmid: &Uuid) -> VmManageResult<Uuid> {
@@ -601,6 +679,6 @@ impl FirecrackerVmManagePool {
         vmid: &Uuid,
         snapshot_id: &Uuid,
     ) -> VmManageResult<Vec<PgSnapshotElement>> {
-        self.get_detail_vm_mem_snapshot(vmid, snapshot_id).await
+        self.get_vm_mem_snapshot_detail(vmid, snapshot_id).await
     }
 }

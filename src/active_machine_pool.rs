@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, path::PathBuf, sync::{Arc, Mutex}};
+use std::{path::PathBuf, sync::{Arc, Mutex}};
 
 use log::{as_serde, error, info};
 use moka::{future::{Cache, FutureExt}, notification::ListenerFuture, policy::EvictionPolicy};

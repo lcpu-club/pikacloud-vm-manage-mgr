@@ -149,10 +149,6 @@ pub struct SnapshotInfo {
     pub created_at: DateTime<Local>,
 }
 
-
-pub(crate) const MAX_CACHE_CAPACITY_ENV: &'static str = "MAX_CACHE_CAPACITY";
-pub(crate) const DEFAULT_MAX_CACHE_CAPACITY: u64 = 10000;
-
 pub(crate) const MACHINE_CORE_TABLE_NAME: &'static str = "MACHINE_CORE_TABLE_NAME";
 pub(crate) const DEFAULT_MACHINE_CORE_TABLE: &'static str = "machine_core";
 
@@ -164,84 +160,66 @@ pub(crate) const DEFAULT_VM_MEM_SNAPSHOT_TABLE: &'static str = "snapshots";
 
 // SQLs
 
-const CREATE_VMVIEWCONFIGS_TABLE_SQL: &'static str = r#"
+pub const CREATE_VMVIEWCONFIGS_TABLE_SQL: &'static str = r#"
     CREATE TABLE if not exists $1 (
-        id                  INT SERIAL PRIMARY KEY,
-        user_id             VARCHAR(128) NOT NULL,
-        vmid                VARCHAR(128) NOT NULL,
-        execute_dir         VARCHAR(256) NOT NULL,
+        vmid                UUID PRIMARY KEY,
         config              JSON
     );
 "#;
+pub const DROP_VMVIEWCONFIGS_TABLE_SQL: &'static str = r#"
+    DROP TABLE if exists $1;
+"#;
+pub const GET_VMVIEWCONFIGS_BY_VMID: &'static str = r#"
+    SELECT * FROM $1 WHERE vmid = $2;
+"#;
+pub const INSERT_VMVIEWCONFIGS_BY_VMID: &'static str = r#"
+    INSERT INTO $1 (vmid, config) VALUES ($2, $3);
+"#;
+pub const DELETE_VMVIEWCONFIGS_BY_VMID: &'static str = r#"
+    DELETE * FROM $1 WHERE vmid = $2;
+"#;
 
-const CREATE_MACHINE_CORE_TABLE_SQL: &'static str = r#"
+
+
+pub const CREATE_MACHINE_CORE_TABLE_SQL: &'static str = r#"
     CREATE TABLE if not exists $1 (
         vmid                UUID,
         machine_core        JSON
     );
 "#;
-
-const DROP_VMVIEWCONFIGS_TABLE_SQL: &'static str = r#"
+pub const DROP_MAHCINE_CORE_TABLE_SQL: &'static str = r#"
     DROP TABLE if exists $1;
 "#;
+pub const GET_MACHINE_CORE_BY_VMID: &'static str = r#"
+    SELECT * FROM $1 WHERE vmid = $2;
+"#;
+pub const INSERT_MACHINE_CORE_BY_VMID: &'static str = r#"
+    INSERT INTO $1 (vmid, machine_core) VALUES ($2, $3);
+"#;
+pub const DELETE_MACHINE_CORE_BY_VMID: &'static str = r#"
+    DELETE * FROM $1 WHERE vmid = $2;
+"#;
 
-const DROP_MAHCINE_CORE_TABLE_SQL: &'static str = r#"
+
+
+pub const CREATE_VM_MEM_SNAPSHOT_TABLE_SQL: &'static str = r#"
+    CREATE TABLE if not exists $1 (
+        vmid                UUID,
+        snapshot_id         UUID,
+        mem_file_path       VARCHAR(256),
+        snapshot_path       VARCHAR(256)
+    );
+"#;
+pub const DROP_VM_MEM_SNAPSHOT_TABLE_SQL: &'static str = r#"
     DROP TABLE if exists $1;
 "#;
-
-const GET_VMVIEWCONFIGS_SQL: &'static str = r#"
-    SELECT * FROM $1;
+pub const GET_VM_MEM_SNAPSHOT_BY_ID: &'static str = r#"
+    SELECT * FROM $1 WHERE vmid = $2 AND snapshot_id = $3; 
 "#;
-
-const GET_VMVIEWCONFIGS_BY_USER_ID: &'static str = r#"
-    SELECT * FROM $1 WHERE user_id = $2;
+pub const INSERT_VM_MEM_SNAPSHOT_BY_ID: &'static str = r#"
+    INSERT INTO $1 (vmid, snapshot_id, mem_file_path, snapshot_path)
+    VALUES ($2, $3, $4, $5);
 "#;
-
-const GET_VMVIEWCONFIGS_BY_VMID: &'static str = r#"
-    SELECT * FROM $1 WHERE vmid = $2;
+pub const DELETE_VM_MEM_SNAPSHOT_BY_ID: &'static str = r#"
+    DELETE * FROM $1 WHERE vmid = $2 AND snapshot_id = $3;
 "#;
-
-const GET_MACHINE_CORE: &'static str = r#"
-    SELECT * FROM $1;
-"#;
-
-const GET_MACHINE_CORE_BY_VMID: &'static str = r#"
-    SELECT * FROM $1 WHERE vmid = $2;
-"#;
-
-pub async fn drop_vmviewconfigs_table(db: &PgPool) -> Result<(), VmManageError> {
-    sqlx::query(DROP_VMVIEWCONFIGS_TABLE_SQL)
-        .execute(db)
-        .await?;
-    Ok(())
-}
-
-pub async fn create_vmviewconfigs_table(db: &PgPool) -> Result<(), VmManageError> {
-    let _ = sqlx::query(CREATE_VMVIEWCONFIGS_TABLE_SQL).execute(db).await?;
-    Ok(())
-}
-
-// 获取所有的虚拟机config信息
-pub async fn get_configs(db: &PgPool) -> Result<Vec<VmViewConfig>, VmManageError> {
-    Ok(sqlx::query(GET_VMVIEWCONFIGS_SQL)
-        .map(|row: PgRow| VmViewConfig {
-            user_id: row.try_get("user_id").ok(),
-            vmid: row.try_get("vmid").ok(),
-            execute_dir: row.try_get("execute_dir").ok(),
-            config: row.try_get("config").ok(),
-        })
-        .fetch_all(db)
-        .await?)
-}
-
-pub async fn get_config_by_user_id(db: &PgPool) -> Result<Vec<VmViewConfig>, VmManageError> {
-    Ok(sqlx::query(GET_VMVIEWCONFIGS_BY_USER_ID)
-        .map(|row: PgRow| VmViewConfig {
-            user_id: row.try_get("user_id").ok(),
-            vmid: row.try_get("vmid").ok(),
-            execute_dir: row.try_get("execute_dir").ok(),
-            config: row.try_get("config").ok(),
-        })
-        .fetch_all(db)
-        .await?)
-}

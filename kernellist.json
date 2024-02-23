@@ -1,21 +1,22 @@
-{
-    "Ubuntu": [
-        {
-            "version": "22.04",
-            "path": "./ubuntu-22.04.img"
-        },
-        {
-            "version": "20.04",
-            "path": "./ubuntu-20.04.img"
-        }
-    ],
-    "Centos": {
-        "version": null
+[
+    {
+        "kernel_name": "Ubuntu",
+        "kernel_version": "22.04",
+        "path": "/path/to/ubuntu/22.04"
     },
-    "Debian": {
-        "version": null
+    {
+        "kernel_name": "Ubuntu",
+        "kernel_version": "18.04",
+        "path": "/path/to/ubuntu/18.04"
     },
-    "Fedora": {
-        "version": null
+    {
+        "kernel_name": "Windows",
+        "kernel_version": "11",
+        "path": "/path/to/windows/11"
+    },
+    {
+        "kernel_name": "Windows",
+        "kernel_version": "7",
+        "path": "/path/to/windows/7"
     }
-}
+]
