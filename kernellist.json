@@ -1,0 +1,21 @@
+{
+    "Ubuntu": [
+        {
+            "version": "22.04",
+            "path": "./ubuntu-22.04.img"
+        },
+        {
+            "version": "20.04",
+            "path": "./ubuntu-20.04.img"
+        }
+    ],
+    "Centos": {
+        "version": null
+    },
+    "Debian": {
+        "version": null
+    },
+    "Fedora": {
+        "version": null
+    }
+}

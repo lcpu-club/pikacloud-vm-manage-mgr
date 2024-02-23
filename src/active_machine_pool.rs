@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::{Arc, Mutex}};
+use std::{collections::BTreeMap, path::PathBuf, sync::{Arc, Mutex}};
 
 use log::{as_serde, error, info};
 use moka::{future::{Cache, FutureExt}, notification::ListenerFuture, policy::EvictionPolicy};
@@ -7,7 +7,7 @@ use sqlx::{PgPool, types::uuid};
 use chrono::prelude::*;
 use uuid::Uuid;
 
-use crate::{error::{VmManageError, VmManageResult}, models::{SnapshotInfo, VmViewInfo, DEFAULT_MACHINE_CORE_TABLE, DEFAULT_SNAPSHOT_TABLE, DEFAULT_VM_CONFIG_TABLE, MACHINE_CORE_TABLE_NAME, SNAPSHOT_TABLE_NAME, VM_CONFIG_TABLE_NAME}};
+use crate::{error::{VmManageError, VmManageResult}, models::{SnapshotInfo, VmViewInfo, DEFAULT_MACHINE_CORE_TABLE, DEFAULT_VM_MEM_SNAPSHOT_TABLE, DEFAULT_VM_CONFIG_TABLE, MACHINE_CORE_TABLE_NAME, VM_MEM_SNAPSHOT_TABLE_NAME, VM_CONFIG_TABLE_NAME}};
 
 
 /// Serve as a cache and manage connection with Postgresql
@@ -137,7 +137,7 @@ impl ActiveMachinePool {
     }
 
     fn snapshot_storage_table(&self) -> String {
-        format!("{}_{}", std::env::var(SNAPSHOT_TABLE_NAME).unwrap_or(DEFAULT_SNAPSHOT_TABLE.to_string()), self.pool_id)
+        format!("{}_{}", std::env::var(VM_MEM_SNAPSHOT_TABLE_NAME).unwrap_or(DEFAULT_VM_MEM_SNAPSHOT_TABLE.to_string()), self.pool_id)
     }
 }
 
@@ -235,16 +235,16 @@ impl ActiveMachinePool {
     /// Create a machine into the pool
     /// dump the core and configuration into database
     pub async fn create_machine(&self, vmid: Uuid, cfg: &Config) -> VmManageResult<()> {
-        let (machine, _exit_ch) = Machine::new(cfg.clone())?;
+        let machine = Machine::new(cfg.clone())?;
         let core = machine.dump_into_core()?;
 
         // cache the machine
         self.machines
             .insert(vmid, Arc::new(Mutex::new(machine)))
             .await;
-        // store the machine core
+        // store the machine core to postgres
         self.store_core(vmid, &core).await?;
-        // store the config
+        // store the config to postgres
         self.store_config(vmid, cfg).await?;
 
         Ok(())
@@ -352,7 +352,7 @@ impl ActiveMachinePool {
             .fetch_one(&self.conn)
             .await?;
         let core = element.machine_core.0;
-        let (machine, _exit_ch) = Machine::rebuild(core)?;
+        let machine = Machine::rebuild(core)?;
         Ok(machine)
     }
 
@@ -365,7 +365,7 @@ impl ActiveMachinePool {
         
         for element in elements {
             let core = element.machine_core.0;
-            let (machine, _exit_ch) = Machine::rebuild(core)?;
+            let machine = Machine::rebuild(core)?;
             self.machines.insert(element.vmid, Arc::new(Mutex::new(machine))).await;
         }
 
@@ -389,7 +389,7 @@ impl ActiveMachinePool {
                 .fetch_one(&self.conn)
                 .await?;
             let core = element.machine_core.0;
-            let (mut machine, _exit_ch) = Machine::rebuild(core)?;
+            let mut machine = Machine::rebuild(core)?;
             let info = machine.describe_instance_info().await?;
             let config = machine.get_config();
             let full_config = machine.get_export_vm_config().await?;
@@ -425,7 +425,7 @@ impl ActiveMachinePool {
             .fetch_one(&self.conn)
             .await?;
             let core = element.machine_core.0; 
-            let (machine, _exit_ch) = Machine::rebuild(core)?;
+            let machine = Machine::rebuild(core)?;
             machine.create_snapshot(memory_path, snapshot_path).await?;
         }
 
@@ -469,7 +469,7 @@ impl ActiveMachinePool {
             .fetch_one(&self.conn)
             .await?;
             let core = element.machine_core.0; 
-            let (mut machine, _exit_ch) = Machine::rebuild(core)?;
+            let mut machine = Machine::rebuild(core)?;
             machine.load_from_snapshot(&snapshot_load_params).await?;
         }
 
@@ -489,7 +489,7 @@ impl ActiveMachinePool {
             .fetch_one(&self.conn)
             .await?;
             let core = element.machine_core.0; 
-            let (machine, _exit_ch) = Machine::rebuild(core)?;
+            let machine = Machine::rebuild(core)?;
             machine.update_metadata(metadata).await?;
         }
 
@@ -500,5 +500,20 @@ impl ActiveMachinePool {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
 
+    const TEST_DATABASE: &'static str = "postgres://xuehaonan:xuehaonan@localhost/vm_manage";
+
+    async fn fetch_conn() -> VmManageResult<sqlx::Pool<sqlx::Postgres>> {
+        let conn = sqlx::postgres::PgPoolOptions::new().connect(TEST_DATABASE).await?;
+        Ok(conn)
+    }
+
+    #[tokio::test]
+    async fn test_new_pool() -> VmManageResult<()> {
+        let conn = fetch_conn().await?;
+        let pool = ActiveMachinePool::new(Uuid::new_v4(), 256, conn).await;
+        
+        Ok(())
+    }
 }

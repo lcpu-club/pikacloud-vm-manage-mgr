@@ -22,13 +22,24 @@ pub struct ErrorResponse {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct VmCreateRequest {
+    pub config: MachineCreateConfig,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct VmCreateResponse {
     pub vmid: Uuid,
-    pub config: Config,
+    pub created_at: chrono::DateTime<Local>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct VmQueryStatusRequest {
     pub vmid: Uuid,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct VmQueryStatusResponse {
+    pub vmid: Uuid,
+    pub info: VmViewInfo,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -46,8 +57,20 @@ pub struct VmOperateRequest {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct VmOperateResponse {
+    pub vmid: Uuid,
+    pub time: chrono::DateTime<Local>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct VmDeleteRequest {
     pub vmid: Uuid,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct VmDeleteResponse {
+    pub vmid: Uuid,
+    pub time: chrono::DateTime<Local>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -70,12 +93,37 @@ pub struct VmModifyMetadataRequest {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct VmModifyMetadataResponse {
+    pub vmid: Uuid,
+    pub time: chrono::DateTime<Local>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct VmSnapshotDetailRequest {
     pub vmid: Uuid,
     pub snapshot_id: Uuid,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct VmRestoreAllRequest {}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct VmRestoreAllResponse {
+    pub infos: Vec<VmViewInfo>,
+}
+
 // Schemas
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct MachineCreateConfig {
+    pub memory_size_in_mib: i32,
+    pub vcpu_count: i32,
+    pub kernel_name: String,
+    pub kernel_version: String,
+    pub enable_hyperthreading: Option<bool>,
+    pub initial_metadata: Option<String>,
+    pub volume_size_in_mib: i32,
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct VmViewConfig {
@@ -111,35 +159,54 @@ pub(crate) const DEFAULT_MACHINE_CORE_TABLE: &'static str = "machine_core";
 pub(crate) const VM_CONFIG_TABLE_NAME: &'static str = "VM_CONFIG_TABLE_NAME";
 pub(crate) const DEFAULT_VM_CONFIG_TABLE: &'static str = "vmconfig";
 
-pub(crate) const SNAPSHOT_TABLE_NAME: &'static str = "SNAPSHOT_TABLE_NAME";
-pub(crate) const DEFAULT_SNAPSHOT_TABLE: &'static str = "snapshots";
+pub(crate) const VM_MEM_SNAPSHOT_TABLE_NAME: &'static str = "SNAPSHOT_TABLE_NAME";
+pub(crate) const DEFAULT_VM_MEM_SNAPSHOT_TABLE: &'static str = "snapshots";
 
 // SQLs
 
 const CREATE_VMVIEWCONFIGS_TABLE_SQL: &'static str = r#"
-    CREATE TABLE if not exists vmviewconfigs (
+    CREATE TABLE if not exists $1 (
         id                  INT SERIAL PRIMARY KEY,
         user_id             VARCHAR(128) NOT NULL,
         vmid                VARCHAR(128) NOT NULL,
         execute_dir         VARCHAR(256) NOT NULL,
-        config              JSON,
+        config              JSON
+    );
+"#;
+
+const CREATE_MACHINE_CORE_TABLE_SQL: &'static str = r#"
+    CREATE TABLE if not exists $1 (
+        vmid                UUID,
+        machine_core        JSON
     );
 "#;
 
 const DROP_VMVIEWCONFIGS_TABLE_SQL: &'static str = r#"
-    DROP TABLE if exists vmviewconfigs;
+    DROP TABLE if exists $1;
+"#;
+
+const DROP_MAHCINE_CORE_TABLE_SQL: &'static str = r#"
+    DROP TABLE if exists $1;
 "#;
 
 const GET_VMVIEWCONFIGS_SQL: &'static str = r#"
-    SELECT * FROM vmviewconfigs;
+    SELECT * FROM $1;
 "#;
 
 const GET_VMVIEWCONFIGS_BY_USER_ID: &'static str = r#"
-    SELECT * FROM vmviewconfigs WHERE user_id = $1;
+    SELECT * FROM $1 WHERE user_id = $2;
 "#;
 
 const GET_VMVIEWCONFIGS_BY_VMID: &'static str = r#"
-    SELECT * FROM vmviewconfigs WHERE vmid = $1;
+    SELECT * FROM $1 WHERE vmid = $2;
+"#;
+
+const GET_MACHINE_CORE: &'static str = r#"
+    SELECT * FROM $1;
+"#;
+
+const GET_MACHINE_CORE_BY_VMID: &'static str = r#"
+    SELECT * FROM $1 WHERE vmid = $2;
 "#;
 
 pub async fn drop_vmviewconfigs_table(db: &PgPool) -> Result<(), VmManageError> {
