@@ -1,1 +1,1 @@
-# pikacloud-vm-manage-mgr
+# pikacloud-vm-mgr
